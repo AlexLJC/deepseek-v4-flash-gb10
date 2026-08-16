@@ -201,6 +201,14 @@ per-stream tok/s  = 3900 / (82.5 + 22.94N)
 aggregate tok/s   = N * per-stream            asymptote 170
 ```
 
+**Trust the rates, not the split.** We later caught this fit assuming L=3.9 on
+sweep content whose true L is 2.74 (see the draft-depth section) — the constants
+absorbed a ~1.4x error that happens to cancel against the real workload's
+longer-context attention cost. The rate predictions below are validated end to
+end at k=5 on real content and are what we plan with; the physical
+interpretation of the two terms, and any cross-k arithmetic derived from them,
+is not sound. It cost us one wrong tuning direction before we caught it.
+
 It then predicted real agent cells it was never fitted on:
 
 | N (mean in-flight) | per-stream measured | model | error |
@@ -401,19 +409,41 @@ tokens. Combining the time split with the token counts, **one decode token costs
 44.5x one prefill token**. There is no version of context reduction worth more
 than a few percent on a decode-bound workload behind a 94% cache.
 
-### `MTP_NUM_TOKENS` 5 -> 4: net loss at these context lengths
+### Draft depth (`MTP_NUM_TOKENS`): the answer depends on your content, and a
+### synthetic benchmark will give you the wrong one
 
-Commonly justified by the fifth draft position surviving only ~8%. That figure
-comes from long-context profiles. At 27k-61k contexts, live per-position
-counters gave:
+We went around this one twice, and both passes are worth recording because the
+second refuted our own first correction.
+
+**Acceptance is a property of the content, not the model.** The same k=5
+configuration, measured live:
 
 ```text
-position     0       1       2       3       4
-survival   86.6%   70.9%   56.2%   43.6%   33.2%
+per-position survival        pos0   pos1   pos2   pos3   pos4      L
+real coding-agent turns     86.6%  70.9%  56.2%  43.6%  33.2%    3.905
+synthetic benchmark prompt  72.4%  47.5%  28.9%  16.0%   9.4%    2.744
 ```
 
-The fifth draft is **4x more valuable** here than the number used to justify
-removing it.
+Real agent content — structured, repetitive, full of tool output — drafts far
+better at depth than a temperature-0.7 free-form prompt. Any acceptance number
+quoted without naming its content is not comparable to yours.
+
+**Forward time scales with draft depth.** Measured at N=12 by varying only k:
+T_forward = 221 / ~200 / 162 ms for k = 5 / 3 / 2. Each draft token is a
+sequential draft-model pass plus a wider verify.
+
+**So the trade inverts between workloads.** On the synthetic sweep, k=2 beat
+k=5 by ~9% aggregate at N=12 — the deep positions it gives up are nearly
+worthless there. Priced for real content (L ratio 3.905/2.575 against the
+~59 ms forward-time saving on a ~340 ms real forward), the same change projects
+**~20% slower**. The faster community configurations running k=2 are not wrong;
+they are measured on content where k=2 is right. Ours is not that content, and
+k stays 5.
+
+This also dissolved most of our gap to the fastest published dual-GB10 figure
+(195 tok/s at c=16 against our 143.3): extrapolating our own k=2 sweep to N=16
+lands at ~176 — the residual is ~10%, not 36%, and the configuration that
+produces their number would slow our lane down.
 
 ### Prefill chunking (`long_prefill_token_threshold`): premise disproved
 
