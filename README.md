@@ -103,17 +103,41 @@ generated                    733
 wall                        6.08 s
 ```
 
-### Latency
+### Latency and prefill
+
+Idle, single request:
+
+```text
+TTFT floor (short prompt)          0.29 s
+fresh prefill rate               1,739 tok/s    slope method, 12k -> 48k tokens of
+                                                cache-defeating random content
+48k-token fully cold prompt       27.2 s end to end
+```
+
+At the operating point (16 agent dispatches, 12 seats):
 
 ```text
 TTFT mean                  24.6 s         710 requests
-inter-token latency        266 ms
+inter-token latency        266 ms         see caveat below
 end-to-end per request     73.3 s
 ```
 
-TTFT is high because these are agent turns arriving into a loaded server with a
-queue, not isolated requests. On an idle cluster a single stream runs at
-**37-40 tok/s**; at the operating point it runs at 13.90.
+**The loaded TTFT is queueing, not prefill.** A typical agent turn presents
+~2,155 fresh tokens behind the 94% prefix cache — about **1.2 s** of prefill at
+the measured rate. The other ~23 s of the loaded mean is waiting for a seat.
+Size the two separately or the number misleads.
+
+**Two measurement traps worth naming:**
+
+- Streaming `time_starttransfer` reads **0.01-0.03 s** on this server — vLLM
+  emits the first SSE chunk (the role delta) *before* prefill completes. Anyone
+  benchmarking TTFT off the first stream byte is measuring the HTTP layer, not
+  the model. Use the first *content* token, or a non-streaming
+  `max_tokens=1` request (our 0.29 s).
+- The 266 ms "inter-token latency" is really **decode-step cadence**. With MTP
+  accepting ~3.9 tokens per forward, tokens arrive in bursts of ~4 every
+  266-358 ms rather than one every 70-80 ms. Smooth-reading clients hide this;
+  latency histograms do not.
 
 ### Speculative decoding (DSpark MTP, k=5)
 
