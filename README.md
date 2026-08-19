@@ -4,17 +4,29 @@ Measurement notes from serving `DeepSeek-V4-Flash-0731` across 2x GB10 (SM121)
 over vLLM with DSpark speculative decoding, driving a real coding-agent workload
 rather than a synthetic benchmark.
 
-Most of what follows is **negative results**. Nine of the eleven knobs we tried
-returned nothing or made things worse, and two of our own explanations turned out
-to be wrong under scrutiny. Those are recorded with the evidence that killed
+Most of what follows is **negative results**. Nine of the twelve knobs we tried
+returned nothing or made things worse, and four of our own explanations turned
+out to be wrong under scrutiny. Those are recorded with the evidence that killed
 them, because they were the expensive part.
+
+---
+
+## Detailed experiment reports
+
+- [Experiment index](experiments/README.md)
+- [`SpinCondition` bounded-sleep C16 full A/B](experiments/spincondition-bounded-sleep/README.md)
+  — process-level CPU attribution, matched-power thermal analysis, complete
+  latency/capacity metrics, limitations, and upstream PR guidance for the
+  250-microsecond bounded-sleep experiment.
 
 ---
 
 ## Hardware and stack
 
 ```text
-2x ASUS Ascent GX10 (NVIDIA GB10, SM121), 121 GB unified memory per node
+2x ASUS Ascent GX10 (NVIDIA GB10, SM121)
+memory        121.62 GiB visible per node (MemTotal 127,535,204 kB);
+              128 GiB nominal before firmware carveout
 interconnect  ConnectX-7, RoCE, ~109 Gbit/s per path, 185.13 Gbit/s dual-path
 NCCL          16 GiB AllGather 21.40 GB/s busbw, 0 wrong
 topology      TP=2 across both nodes, PP=1, EP off
@@ -31,7 +43,7 @@ against these versions.
 repo              deepseek-ai/DeepSeek-V4-Flash-0731
 revision          7872f01b1d1fe23eabc4c98b48bffcef5a386062
 shards            48
-weight bytes      166,886,535,336
+weight bytes      166,886,535,336   = 155.43 GiB
 config.json       sha256 6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023
 tokenizer.json    sha256 8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf
 architecture      DeepseekV4ForCausalLM     43 layers, hidden 4096
@@ -66,8 +78,11 @@ platform fw       GX10DGX.0105.2026.0505.1153
 GPU clocks        default (no -lgc lock); SM 2411 MHz, ceiling 3003 MHz
 ```
 
-**TP=2 across nodes is not a choice.** The checkpoint is 166.9 GB against 121 GB
-of unified memory per node, so it cannot fit on one. Everything below assumes
+**TP=2 across nodes is not a choice.** The checkpoint is 155.43 GiB against
+121.62 GiB of OS-visible unified memory per node, so it cannot fit on one — the
+engine's own loader prints the same figure (`Checkpoint size: 155.43 GiB`).
+Quote both sides in the same units: 166.9 decimal GB against 121 binary GiB
+inflates the apparent deficit from 28% to 38%. Everything below assumes
 that constraint.
 
 The workload is a coding agent (OpenAI `codex` CLI) doing real repository tasks —
@@ -91,10 +106,17 @@ per-stream                 13.90 tok/s
 wall                       26.8 min       for 16 dispatches, 265 turns
 prefix cache hit           92.6%
 KV pool usage              <10%           zero preemptions
-node peak temperature      96.7 C         no trip (only trip point is 104 C)
+head SoC peak (TSOC)       96.7 C         no trip (only trip point is 104 C)
 ```
 
+`G` for this cell is 12,142 generated tokens per dispatch, from the
+**output-capped** pool. Its `dispatches/hour` is therefore not comparable to the
+6- and 8-seat rows below, which use the full pool — see the metric-identity
+section.
+
 ### Per turn
+
+At this operating point (12 seats, prefix cache 92.6%):
 
 ```text
 prompt tokens             34,178
@@ -123,8 +145,8 @@ end-to-end per request     73.3 s
 ```
 
 **The loaded TTFT is queueing, not prefill.** A typical agent turn presents
-~2,155 fresh tokens behind the 94% prefix cache — about **1.2 s** of prefill at
-the measured rate. The other ~23 s of the loaded mean is waiting for a seat.
+~2,522 fresh tokens behind the 92.6% prefix cache — about **1.5 s** of prefill
+at the measured rate. The other ~23 s of the loaded mean is waiting for a seat.
 Size the two separately or the number misleads.
 
 **Two measurement traps worth naming:**
@@ -146,11 +168,13 @@ acceptance                57.5%           126,869 drafts
 accepted per forward       3.88 of 5
 ```
 
-Per-position survival, at the 27k-61k contexts this workload reaches:
+Per-position survival over this cell, at the 27k-61k contexts this workload
+reaches. A second, longer window is reported in the draft-depth section; the two
+agree to within a point per position:
 
 ```text
 position     0       1       2       3       4
-survival   86.0%   69.9%   55.4%   43.0%   33.2%
+survival   86.0%   69.9%   55.4%   43.0%   33.2%     L = 3.88
 ```
 
 Acceptance was stable at 58-61% across every seat count tested, including under
@@ -192,11 +216,15 @@ per dispatch and is **not** controlled — see the metric-identity section for w
 | 8 | 24 | 49.1 | 29.31 | 117.96 | 14,490 | 6.73 | 17.65 | 8 | ok |
 | **12** | **16** | **26.8** | **35.78** | **120.67** | 12,142 | **9.28** | **13.90** | **12** | **recipe** |
 | 12 | 24 | 41.0 | 35.14 | 116.15 | 11,898 | 8.28 | 15.03 | 12 | ok |
-| 16 | 24 | 12.2 | — | — | — | 13.15 | — | 16 | **deadlock** |
+| 16 | 24 | 12.2 | 118.08† | — | — | 13.15 | — | 16 | **deadlock** |
 
-Rows at 8 and 12 slots use the full task pool; 16 and 24 slots use an
+Rows at 1 through 12 slots use the full task pool; 16 and 24 slots use an
 output-capped variant, which is why their `G` is lower. Compare within a pool, or
-use in-flight and per-stream.
+use in-flight and per-stream. The nine tasks are rotated across the slots, so a
+cell with more slots than tasks runs some tasks more than once.
+
+† the deadlocked cell still reported a throughput figure — see the operational
+notes. It is shown here so that number has a home; it is not a result.
 
 ### Reproducing
 
@@ -235,15 +263,16 @@ is not sound. It cost us one wrong tuning direction before we caught it.
 
 It then predicted real agent cells it was never fitted on:
 
-| N (mean in-flight) | per-stream measured | model | error |
+| N (mean in-flight) | per-stream measured | model | (measured-model)/model |
 |---:|---:|---:|---:|
-| 4.57 | 20.49 | 20.82 | +1.6% |
+| 4.57 | 20.49 | 20.82 | -1.6% |
 | 6.73 | 17.65 | 16.46 | +7.2% |
 | 6.80 | 17.56 | 16.36 | +7.3% |
 | 8.28 | 15.03 | 14.32 | +5.0% |
 | 9.28 | 13.90 | 13.20 | +5.3% |
 
-Consistently 5-7% above the model, never below. Independently, vLLM's own
+Four of the five cells sit 5.0-7.4% above the model; the lowest-N cell sits
+1.6% below. Independently, vLLM's own
 `Avg generation throughput` logger across 2,654 samples, bucketed by
 `Running: N`:
 
@@ -253,8 +282,8 @@ N=6 111.3    N=7 102.2    N=8 119.4    N=15 143.2   N=16 143.3
 ```
 
 The model was fitted at ~850-token contexts and predicts cells running at
-27k-61k contexts to within 1.5%. **Context length does not move the decode
-curve** at these lengths.
+27k-61k contexts to within 5.0-7.4%, with no trend in that error against context
+length. **Context length does not move the decode curve** at these lengths.
 
 **Aggregate throughput is set almost entirely by mean in-flight N.** Everything
 else we tried moved single digits or nothing.
@@ -303,7 +332,8 @@ The one server change that paid. Measured on the same task pool:
 12 seats   in-flight 9.28   per-stream 13.90   decode-window agg 129.06
 ```
 
-+8.1% aggregate for -20.8% per-dispatch latency. Which side of that you want
++8.1% aggregate for a 20.8% drop in per-stream rate — that is **+26.3%
+per-dispatch latency**. Which side of that you want
 depends on whether your work is throughput-shaped or latency-shaped — see the
 trade-off section.
 
@@ -345,6 +375,13 @@ neither is cooling — see below.
 
 ### Thermals: never the constraint
 
+Here, "not the constraint" means the GPU did not thermally throttle and the
+observed throughput cells were not clock-limited. It does **not** mean CPU busy
+work is thermally free on a unified-memory SoC. A later matched experiment
+isolated roughly 1.9 head-only CPU cores in vLLM's shared-memory wait path and
+measured a material TSOC reduction after removing that spin; see the
+[`SpinCondition` bounded-sleep report](experiments/spincondition-bounded-sleep/README.md).
+
 We moved the nodes physically, added external cooling, raised a guard threshold,
 and lost one complete run to a false trip. The relevant counters, read late:
 
@@ -354,9 +391,18 @@ SW Thermal Slowdown          73,731 us   = 0.074 s
 HW Thermal Slowdown               0 us
 ```
 
-Under load: 68 C against the only trip point on any ACPI zone, `critical` at
-104 C. One node consistently runs 6-8 C hotter than the other on identical
-firmware; it never cost throughput.
+Under load the **GPU sensor** reads 68 C against the only trip point on any
+ACPI zone, `critical` at 104 C. The **SoC package sensor** (TSOC) is the hotter
+one and is what the 96.7 C headline figure reports — the two are different
+sensors, not a contradiction.
+
+The head node runs materially hotter than the worker on identical firmware. At
+matched GPU power the mean head-worker TSOC gap measured **10.27 C**, and a
+single-variable synthetic test put the head node at **2.6-2.8x the temperature
+rise for identical work pinned to identical core IDs**, with equal measured
+throughput. Part of that is structural — the head carries EngineCore and the
+local-reader worker — and part is a difference between these two specific units.
+No GPU thermal clock event was recorded in any cell we measured.
 
 We had also claimed "zero thermal throttling" repeatedly. It is 74 ms, not zero —
 negligible, but not what we said. And the counter that was actually accumulating,
@@ -379,8 +425,9 @@ Raising a cap above demand measures nothing.
 
 ### `max_num_seqs` 16: engine deadlock
 
-It worked, and it was faster — mean 143.3 tok/s against 119.4 at N=8, matching
-the model's predicted +18.4%, peaking at 203.7. For about four minutes.
+It worked, and it was faster — mean 143.3 tok/s against 119.4 at N=8, a
+measured +20.0% against the model's predicted +18.4%, peaking at 203.7. For
+about four minutes.
 
 ```text
 18:32:30  gen=203.7  running=16
@@ -458,7 +505,9 @@ sequential draft-model pass plus a wider verify.
 
 **So the trade inverts between workloads.** On the synthetic sweep, k=2 beat
 k=5 by ~9% aggregate at N=12 — the deep positions it gives up are nearly
-worthless there. Priced for real content (L ratio 3.905/2.575 against the
+worthless there. Priced for real content — L falls from 3.905 at k=5 to
+**2.575** at k=2, which is just `1 + 0.866 + 0.709` from the survival table
+above — the same change projects the other way (L ratio 3.905/2.575 against the
 ~59 ms forward-time saving on a ~340 ms real forward), the same change projects
 **~20% slower**. The faster community configurations running k=2 are not wrong;
 they are measured on content where k=2 is right. Ours is not that content, and
@@ -503,7 +552,11 @@ is not a trade a coding agent can take.
 ## The trade nobody mentions
 
 Aggregate throughput and per-dispatch latency pull in opposite directions, and
-every "+N% throughput" result here is also a "-M% latency" result:
+every "+N% throughput" result here is also a "-M% latency" result.
+
+**This table is projected from the decode model above, not measured.** N=4 and
+N=8 sit inside the fitted range. N=16 we did run once — it reached 143.3 tok/s
+against the 138.8 shown here and then deadlocked. N=32 and N=64 were never run.
 
 | N | aggregate tok/s | per-stream | generation per dispatch | vs N=8 agg | vs N=8 latency |
 |---:|---:|---:|---:|---:|---:|
@@ -585,7 +638,10 @@ speculative: dspark, num_spec_tokens   5
 enable_prefix_caching               true
 enable_chunked_prefill              true
 async_scheduling                    true
-cudagraph_mode        FULL_AND_PIECEWISE   (breakable graphs off)
+max_cudagraph_capture_size            72
+cudagraph_mode        FULL_AND_PIECEWISE   (vLLM default; not passed as a flag.
+                                            Distinct from PIECEWISE alone, which
+                                            cost -46% — see above)
 moe_backend             flashinfer_b12x
 tensor_parallel_size                   2   (forced by model size)
 GPU clocks                       default   (no lgc lock)
